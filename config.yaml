@@ -1,0 +1,41 @@
+# Clip Agent settings. Edit these on GitHub (pencil icon) to change what the agent does.
+
+twitch:
+  # How many of the biggest live Twitch streams to look at each run.
+  top_live_streams: 25
+  # Only streams in these languages (Twitch language codes).
+  languages: [en]
+  # Extra channels to always check (Twitch usernames), even if they are not live.
+  always_check: []
+  # Channels to NEVER clip. Add anyone who complains or files a takedown.
+  blocklist: []
+  # Only consider clips made in the last N hours.
+  lookback_hours: 24
+  # Ignore clips with fewer views than this.
+  min_views: 300
+  # Ignore clips longer than this many seconds.
+  max_seconds: 60
+
+selection:
+  # How many clips to post per run.
+  posts_per_run: 1
+  # How many top candidates to download and judge with AI each run.
+  judge_top: 4
+  # Minimum final score (0-100) needed to post.
+  min_score: 55
+
+video:
+  # Whisper model for captions: tiny, base, small (better), medium (slow).
+  whisper_model: small
+  # Show "twitch.tv/<streamer>" credit on the video.
+  show_credit: true
+
+publish:
+  youtube: true
+  tiktok: false
+  # TikTok only allows SELF_ONLY until your app passes TikTok's audit.
+  tiktok_privacy: SELF_ONLY
+
+ai:
+  # Free Gemini model used to judge clips and write titles.
+  gemini_model: gemini-2.5-flash
