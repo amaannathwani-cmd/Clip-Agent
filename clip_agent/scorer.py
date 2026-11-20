@@ -2,6 +2,7 @@
 import json
 import math
 import re
+import time
 
 import requests
 
@@ -80,6 +81,11 @@ def gemini_json(api_key: str, wanted: str, prompt: str) -> str:
         if alt:
             _resolved_model[wanted] = model = alt
             r = _generate(api_key, model, prompt)
+    for wait in (5, 15):  # Gemini's free tier sometimes returns 503/429 when busy
+        if r.status_code not in (429, 500, 503):
+            break
+        time.sleep(wait)
+        r = _generate(api_key, model, prompt)
     if not r.ok:
         raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
