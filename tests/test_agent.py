@@ -47,3 +47,12 @@ def test_render_makes_vertical_video(tmp_path):
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                             "stream=width,height", "-of", "csv=p=0", str(out)], capture_output=True, text=True)
     assert probe.stdout.strip() == "1080,1920"
+
+
+def test_load_audio_decodes_with_ffmpeg(tmp_path):
+    from clip_agent.media import load_audio
+    src = tmp_path / "a.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2",
+                    str(src)], check=True)
+    audio = load_audio(src)
+    assert 31000 < len(audio) < 33000 and audio.dtype.name == "float32" and abs(audio).max() <= 1.0
