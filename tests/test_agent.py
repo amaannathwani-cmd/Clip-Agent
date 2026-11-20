@@ -56,3 +56,12 @@ def test_load_audio_decodes_with_ffmpeg(tmp_path):
                     str(src)], check=True)
     audio = load_audio(src)
     assert 31000 < len(audio) < 33000 and audio.dtype.name == "float32" and abs(audio).max() <= 1.0
+
+
+def test_pick_flash_model_prefers_newest_stable():
+    from clip_agent.scorer import pick_flash_model
+    names = ["models/gemini-2.5-flash", "models/gemini-3.0-flash", "models/gemini-3.5-flash-preview-09",
+             "models/gemini-3.0-flash-lite", "models/gemini-3.0-pro", "models/gemini-3.0-flash-image"]
+    assert pick_flash_model(names) == "gemini-3.0-flash"
+    assert pick_flash_model(["models/gemini-4-flash-preview"]) == "gemini-4-flash-preview"
+    assert pick_flash_model(["models/gemini-3.0-pro"]) is None

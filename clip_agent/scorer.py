@@ -31,6 +31,44 @@ Reply with JSON only:
 Set unsafe true if it contains slurs, sexual content, real violence, doxxing, or the moment needs lots of context."""
 
 
+GEMINI = "https://generativelanguage.googleapis.com/v1beta"
+_resolved_model: dict[str, str] = {}
+
+
+def pick_flash_model(names: list[str]) -> str | None:
+    """Choose the newest stable general 'flash' model from a ListModels result."""
+    skip = ("lite", "image", "tts", "audio", "live", "embedding", "thinking", "exp")
+    good = [n.removeprefix("models/") for n in names if "flash" in n and not any(k in n for k in skip)]
+    if not good:
+        return None
+    stable = [n for n in good if "preview" not in n] or good
+
+    def version(n: str):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return (float(m.group(1)) if m else 0.0, "latest" in n, -len(n))
+
+    return max(stable, key=version)
+
+
+def resolve_model(api_key: str, wanted: str) -> str:
+    """Use the configured model if it exists, otherwise the newest flash model Google offers."""
+    if wanted in _resolved_model:
+        return _resolved_model[wanted]
+    chosen = wanted
+    try:
+        r = requests.get(f"{GEMINI}/models", params={"key": api_key, "pageSize": 1000}, timeout=30)
+        r.raise_for_status()
+        names = [m["name"] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        if f"models/{wanted}" not in names:
+            chosen = pick_flash_model(names) or wanted
+            print(f"  Gemini model '{wanted}' not available, using '{chosen}'")
+    except Exception as e:
+        print(f"  Could not list Gemini models: {e}")
+    _resolved_model[wanted] = chosen
+    return chosen
+
+
 def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
     fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key"}
     if not api_key:
@@ -45,7 +83,7 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
     )
     try:
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            f"{GEMINI}/models/{resolve_model(api_key, model)}:generateContent",
             params={"key": api_key},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
