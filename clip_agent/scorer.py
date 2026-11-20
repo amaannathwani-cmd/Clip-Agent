@@ -50,23 +50,39 @@ def pick_flash_model(names: list[str]) -> str | None:
     return max(stable, key=version)
 
 
-def resolve_model(api_key: str, wanted: str) -> str:
-    """Use the configured model if it exists, otherwise the newest flash model Google offers."""
-    if wanted in _resolved_model:
-        return _resolved_model[wanted]
-    chosen = wanted
-    try:
-        r = requests.get(f"{GEMINI}/models", params={"key": api_key, "pageSize": 1000}, timeout=30)
-        r.raise_for_status()
-        names = [m["name"] for m in r.json().get("models", [])
-                 if "generateContent" in m.get("supportedGenerationMethods", [])]
-        if f"models/{wanted}" not in names:
-            chosen = pick_flash_model(names) or wanted
-            print(f"  Gemini model '{wanted}' not available, using '{chosen}'")
-    except Exception as e:
-        print(f"  Could not list Gemini models: {e}")
-    _resolved_model[wanted] = chosen
-    return chosen
+def list_models(api_key: str) -> list[str]:
+    r = requests.get(f"{GEMINI}/models", params={"key": api_key, "pageSize": 1000}, timeout=30)
+    r.raise_for_status()
+    return [m["name"] for m in r.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])]
+
+
+def _generate(api_key: str, model: str, prompt: str) -> requests.Response:
+    return requests.post(
+        f"{GEMINI}/models/{model}:generateContent",
+        params={"key": api_key},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
+        },
+        timeout=60,
+    )
+
+
+def gemini_json(api_key: str, wanted: str, prompt: str) -> str:
+    """Call Gemini; if the model is gone (404), switch to the newest flash model and retry."""
+    model = _resolved_model.get(wanted, wanted)
+    r = _generate(api_key, model, prompt)
+    if r.status_code == 404:
+        names = [n for n in list_models(api_key) if n.removeprefix("models/") != model]
+        alt = pick_flash_model(names)
+        print(f"  Gemini model '{model}' unavailable ({r.text[:150]!r}); switching to '{alt}'")
+        if alt:
+            _resolved_model[wanted] = model = alt
+            r = _generate(api_key, model, prompt)
+    if not r.ok:
+        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
@@ -82,17 +98,7 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
         transcript=(transcript or "(no speech)")[:3000],
     )
     try:
-        r = requests.post(
-            f"{GEMINI}/models/{resolve_model(api_key, model)}:generateContent",
-            params={"key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = gemini_json(api_key, model, prompt)
         return parse_judgement(text, clip.title)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")
