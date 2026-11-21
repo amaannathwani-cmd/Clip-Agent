@@ -2,6 +2,7 @@
 import json
 import math
 import re
+import time
 
 import requests
 
@@ -31,6 +32,65 @@ Reply with JSON only:
 Set unsafe true if it contains slurs, sexual content, real violence, doxxing, or the moment needs lots of context."""
 
 
+GEMINI = "https://generativelanguage.googleapis.com/v1beta"
+_resolved_model: dict[str, str] = {}
+
+
+def pick_flash_model(names: list[str]) -> str | None:
+    """Choose the newest stable general 'flash' model from a ListModels result."""
+    skip = ("lite", "image", "tts", "audio", "live", "embedding", "thinking", "exp")
+    good = [n.removeprefix("models/") for n in names if "flash" in n and not any(k in n for k in skip)]
+    if not good:
+        return None
+    stable = [n for n in good if "preview" not in n] or good
+
+    def version(n: str):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return (float(m.group(1)) if m else 0.0, "latest" in n, -len(n))
+
+    return max(stable, key=version)
+
+
+def list_models(api_key: str) -> list[str]:
+    r = requests.get(f"{GEMINI}/models", params={"key": api_key, "pageSize": 1000}, timeout=30)
+    r.raise_for_status()
+    return [m["name"] for m in r.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])]
+
+
+def _generate(api_key: str, model: str, prompt: str) -> requests.Response:
+    return requests.post(
+        f"{GEMINI}/models/{model}:generateContent",
+        params={"key": api_key},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
+        },
+        timeout=60,
+    )
+
+
+def gemini_json(api_key: str, wanted: str, prompt: str) -> str:
+    """Call Gemini; if the model is gone (404), switch to the newest flash model and retry."""
+    model = _resolved_model.get(wanted, wanted)
+    r = _generate(api_key, model, prompt)
+    if r.status_code == 404:
+        names = [n for n in list_models(api_key) if n.removeprefix("models/") != model]
+        alt = pick_flash_model(names)
+        print(f"  Gemini model '{model}' unavailable ({r.text[:150]!r}); switching to '{alt}'")
+        if alt:
+            _resolved_model[wanted] = model = alt
+            r = _generate(api_key, model, prompt)
+    for wait in (5, 15):  # Gemini's free tier sometimes returns 503/429 when busy
+        if r.status_code not in (429, 500, 503):
+            break
+        time.sleep(wait)
+        r = _generate(api_key, model, prompt)
+    if not r.ok:
+        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
     fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key"}
     if not api_key:
@@ -44,17 +104,7 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
         transcript=(transcript or "(no speech)")[:3000],
     )
     try:
-        r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": api_key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = gemini_json(api_key, model, prompt)
         return parse_judgement(text, clip.title)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")
