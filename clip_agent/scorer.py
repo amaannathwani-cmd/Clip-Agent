@@ -172,7 +172,10 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str, video: byte
                 raise
             print(f"  AI couldn't watch the video ({str(e)[:120]}); judging from the transcript only")
             text = gemini_json(api_key, model, prompt, None)
-        return parse_judgement(text, clip.title, clip.duration)
+        try:
+            return parse_judgement(text, clip.title, clip.duration)
+        except ValueError:  # malformed JSON: ask once more
+            return parse_judgement(gemini_json(api_key, model, prompt, video), clip.title, clip.duration)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")
         return fallback

@@ -146,3 +146,15 @@ def test_gemini_falls_through_models_on_rate_limit(monkeypatch):
     assert sc.gemini_json("k", "gemini-3.8-flash", "p") == '{"score": 70}'
     assert calls == ["gemini-3.8-flash", "gemini-3.8-flash-lite"]
     assert sc._resolved_model["gemini-3.8-flash"] == "gemini-3.8-flash-lite"
+
+
+def test_spread_words():
+    from types import SimpleNamespace
+    from clip_agent.media import spread_words
+    w = spread_words([SimpleNamespace(start=1.0, end=3.0, text=" no way bro lol")])
+    assert [x.text for x in w] == ["no", "way", "bro", "lol"] and w[1].start == 1.5 and w[-1].end == 3.0
+
+
+def test_haar_face_detector_available():
+    import cv2
+    assert not cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml").empty()

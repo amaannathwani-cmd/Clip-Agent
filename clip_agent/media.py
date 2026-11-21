@@ -54,21 +54,37 @@ def transcribe(path: Path, model_name: str = "small") -> list[Word]:
         return []  # no audio track
     if audio.size < 16000 // 2:
         return []
-    segments = None
-    for vad in (True, False):  # the VAD step occasionally crashes on odd audio; retry without it
+    segments, timed = None, True
+    for vad, word_ts in ((True, True), (False, True), (False, False)):
+        # Word alignment occasionally crashes on odd audio; fall back to segment timings.
         try:
-            segments = list(_model_cache[model_name].transcribe(audio, word_timestamps=True, vad_filter=vad)[0])
+            segments = list(_model_cache[model_name].transcribe(audio, word_timestamps=word_ts, vad_filter=vad)[0])
+            timed = word_ts
             break
         except Exception as e:  # a transcription glitch shouldn't throw away a good clip
-            print(f"  transcription failed (vad={vad}): {e}")
+            print(f"  transcription failed (vad={vad}, words={word_ts}): {e}")
     if segments is None:
         return []
+    if not timed:
+        return spread_words(segments)
     words = []
     for seg in segments:
         for w in seg.words or []:
             text = w.word.strip()
             if text:
                 words.append(Word(float(w.start), float(w.end), text))
+    return words
+
+
+def spread_words(segments) -> list[Word]:
+    """Give each word of a segment an equal share of the segment's time."""
+    words = []
+    for seg in segments:
+        parts = seg.text.split()
+        if not parts:
+            continue
+        step = (seg.end - seg.start) / len(parts)
+        words += [Word(seg.start + i * step, seg.start + (i + 1) * step, p) for i, p in enumerate(parts)]
     return words
 
 
