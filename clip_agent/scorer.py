@@ -82,7 +82,7 @@ def _generate(api_key: str, model: str, prompt: str, video: bytes | None = None)
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
         },
-        timeout=60,
+        timeout=180 if video else 60,
     )
 
 
@@ -122,7 +122,13 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str, video: byte
         transcript=(transcript or "(no speech)")[:3000],
     )
     try:
-        text = gemini_json(api_key, model, prompt, video)
+        try:
+            text = gemini_json(api_key, model, prompt, video)
+        except Exception as e:
+            if not video:
+                raise
+            print(f"  AI couldn't watch the video ({str(e)[:120]}); judging from the transcript only")
+            text = gemini_json(api_key, model, prompt, None)
         return parse_judgement(text, clip.title, clip.duration)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")

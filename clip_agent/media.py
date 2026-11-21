@@ -48,7 +48,18 @@ def transcribe(path: Path, model_name: str = "small") -> list[Word]:
 
     if model_name not in _model_cache:
         _model_cache[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, _ = _model_cache[model_name].transcribe(load_audio(path), word_timestamps=True, vad_filter=True)
+    try:
+        audio = load_audio(path)
+    except subprocess.CalledProcessError:
+        return []  # no audio track
+    if audio.size < 16000 // 2:
+        return []
+    try:
+        segments, _ = _model_cache[model_name].transcribe(audio, word_timestamps=True, vad_filter=True)
+        segments = list(segments)
+    except Exception as e:  # a transcription glitch shouldn't throw away a good clip
+        print(f"  transcription failed: {e}")
+        return []
     words = []
     for seg in segments:
         for w in seg.words or []:
@@ -62,8 +73,8 @@ def proxy_bytes(path: Path, max_bytes: int = 14 * 1024 * 1024) -> bytes | None:
     """A small 360p copy for the AI to watch (inline uploads must stay under ~20MB)."""
     out = path.with_name("proxy.mp4")
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-vf", "scale=-2:360,fps=15",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "32", "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-vf", "scale=-2:240,fps=10",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "34", "-c:a", "aac", "-b:a", "48k", "-ac", "1",
          str(out)],
         check=True,
     )
