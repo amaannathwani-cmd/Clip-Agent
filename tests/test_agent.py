@@ -59,6 +59,8 @@ def test_load_audio_decodes_with_ffmpeg(tmp_path):
 
 
 def test_pick_flash_model_prefers_newest_stable():
+    from clip_agent.scorer import rank_flash_models
+    assert rank_flash_models(["models/gemini-3.8-flash-lite", "models/gemini-3.8-flash"])[0] == "gemini-3.8-flash"
     from clip_agent.scorer import pick_flash_model
     names = ["models/gemini-2.5-flash", "models/gemini-3.0-flash", "models/gemini-3.5-flash-preview-09",
              "models/gemini-3.0-flash-lite", "models/gemini-3.0-pro", "models/gemini-3.0-flash-image"]
@@ -117,3 +119,30 @@ def test_render_each_layout(tmp_path, faces):
     assert "width=1080" in probe and "height=1920" in probe
     dur = float([l for l in probe.splitlines() if l.startswith("duration=")][0].split("=")[1])
     assert 2.8 < dur < 3.3
+
+
+def test_gemini_falls_through_models_on_rate_limit(monkeypatch):
+    import clip_agent.scorer as sc
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._b, self.ok, self.text = code, body, code == 200, str(body)
+
+        def json(self):
+            return self._b
+
+    calls = []
+
+    def fake_generate(key, model, prompt, video=None):
+        calls.append(model)
+        if model == "gemini-3.8-flash":
+            return R(429, {"error": {"message": "quota"}})
+        return R(200, {"candidates": [{"content": {"parts": [{"text": '{"score": 70}'}]}}]})
+
+    monkeypatch.setattr(sc, "_generate", fake_generate)
+    monkeypatch.setattr(sc, "list_models", lambda k: ["models/gemini-3.8-flash", "models/gemini-3.8-flash-lite"])
+    monkeypatch.setattr(sc, "_model_list", None)
+    monkeypatch.setattr(sc, "_resolved_model", {})
+    assert sc.gemini_json("k", "gemini-3.8-flash", "p") == '{"score": 70}'
+    assert calls == ["gemini-3.8-flash", "gemini-3.8-flash-lite"]
+    assert sc._resolved_model["gemini-3.8-flash"] == "gemini-3.8-flash-lite"

@@ -54,11 +54,14 @@ def transcribe(path: Path, model_name: str = "small") -> list[Word]:
         return []  # no audio track
     if audio.size < 16000 // 2:
         return []
-    try:
-        segments, _ = _model_cache[model_name].transcribe(audio, word_timestamps=True, vad_filter=True)
-        segments = list(segments)
-    except Exception as e:  # a transcription glitch shouldn't throw away a good clip
-        print(f"  transcription failed: {e}")
+    segments = None
+    for vad in (True, False):  # the VAD step occasionally crashes on odd audio; retry without it
+        try:
+            segments = list(_model_cache[model_name].transcribe(audio, word_timestamps=True, vad_filter=vad)[0])
+            break
+        except Exception as e:  # a transcription glitch shouldn't throw away a good clip
+            print(f"  transcription failed (vad={vad}): {e}")
+    if segments is None:
         return []
     words = []
     for seg in segments:

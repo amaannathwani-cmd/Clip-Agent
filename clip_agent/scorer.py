@@ -80,31 +80,74 @@ def _generate(api_key: str, model: str, prompt: str, video: bytes | None = None)
         params={"key": api_key},
         json={
             "contents": [{"parts": parts}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4,
+                                 **({"mediaResolution": "MEDIA_RESOLUTION_LOW"} if video else {})},
         },
         timeout=180 if video else 60,
     )
 
 
+def rank_flash_models(names: list[str]) -> list[str]:
+    """All usable flash models, best first: newest stable, then previews, then the cheaper 'lite' ones."""
+    skip = ("image", "tts", "audio", "live", "embedding", "thinking", "exp")
+    good = [n.removeprefix("models/") for n in names if "flash" in n and not any(k in n for k in skip)]
+
+    def key(n: str):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("lite" in n, "preview" in n, -(float(m.group(1)) if m else 0.0), len(n))
+
+    return sorted(dict.fromkeys(good), key=key)
+
+
+def _err(r: requests.Response) -> str:
+    try:
+        return f"{r.status_code} {r.json()['error'].get('message', '')[:160]}"
+    except Exception:
+        return f"{r.status_code} {r.text[:160]}"
+
+
+_model_list: list[str] | None = None
+
+
 def gemini_json(api_key: str, wanted: str, prompt: str, video: bytes | None = None) -> str:
-    """Call Gemini; if the model is gone (404), switch to the newest flash model and retry."""
-    model = _resolved_model.get(wanted, wanted)
-    r = _generate(api_key, model, prompt, video)
-    if r.status_code == 404:
-        names = [n for n in list_models(api_key) if n.removeprefix("models/") != model]
-        alt = pick_flash_model(names)
-        print(f"  Gemini model '{model}' unavailable ({r.text[:150]!r}); switching to '{alt}'")
-        if alt:
-            _resolved_model[wanted] = model = alt
-            r = _generate(api_key, model, prompt, video)
-    for wait in (5, 15):  # Gemini's free tier sometimes returns 503/429 when busy
-        if r.status_code not in (429, 500, 503):
+    """Call Gemini. If a model is retired, rate-limited or overloaded, fall through to the next flash model."""
+    global _model_list
+    first = _resolved_model.get(wanted, wanted)
+    tried, last = [], "no model available"
+    order = [first]
+    while order:
+        model = order.pop(0)
+        if video and tried:
+            time.sleep(2)
+        if model in tried:
+            continue
+        tried.append(model)
+        r = None
+        for attempt in range(2):
+            try:
+                r = _generate(api_key, model, prompt, video)
+            except requests.RequestException as e:
+                last = f"{model}: {type(e).__name__}"
+                break
+            if r.ok:
+                if model != first:
+                    print(f"  using Gemini model '{model}'")
+                _resolved_model[wanted] = model
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            last = f"{model}: {_err(r)}"
+            if r.status_code in (500, 503) and attempt == 0:
+                time.sleep(5)
+                continue
             break
-        time.sleep(wait)
-        r = _generate(api_key, model, prompt, video)
-    if not r.ok:
-        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        if r is not None and not r.ok and r.status_code not in (404, 429, 500, 503):
+            break  # a real error (bad key, bad request): switching models won't help
+        if _model_list is None:
+            try:
+                _model_list = rank_flash_models(list_models(api_key))
+            except Exception:
+                _model_list = []
+        order = [m for m in _model_list if m not in tried] if len(tried) < 4 else []
+    raise RuntimeError(f"Gemini failed ({last})")
 
 
 def ai_judge(clip, transcript: str, api_key: str | None, model: str, video: bytes | None = None) -> dict:
