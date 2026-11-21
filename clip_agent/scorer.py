@@ -1,4 +1,5 @@
 """Score clips: a fast heuristic on view velocity, then an AI judge on the transcript."""
+import base64
 import json
 import math
 import re
@@ -16,20 +17,32 @@ def heuristic_score(clip) -> float:
     return round(100 * (0.6 * v + 0.4 * rel) * length, 1)
 
 
-PROMPT = """You pick Twitch clips to repost as YouTube Shorts / TikToks.
-Judge whether this clip would go viral with people who have never heard of the streamer
-(funny, shocking, skillful, rage, wholesome, a clear moment within the first 3 seconds).
+PROMPT = """You run a viral clips channel that reposts Twitch moments as YouTube Shorts and TikToks.
+You are shown the clip itself (video + audio) plus its transcript. Be a harsh judge: most clips are boring.
+
+What goes viral with strangers who have never heard of the streamer:
+- genuinely funny moments: big reactions, fails, awkward silences, unexpected one-liners, chat or friends roasting them
+- shock / jump scares / rage / "no way" skill moments
+- a clear payoff that lands within ~20 seconds, and a hook in the first 2 seconds
+What does NOT: giveaways, sub alerts, talking about plans, inside jokes, long setups, menus/loading screens,
+clips that are cut off before the payoff, anything that needs context.
 
 Streamer: {streamer}
 Game/category: {game}
 Original clip title: {title}
 Views: {views} in {age:.1f} hours
-Transcript: {transcript}
+Clip length: {duration:.0f}s
+Transcript (with seconds): {transcript}
 
 Reply with JSON only:
-{{"score": 0-100, "reason": "short", "title": "catchy short title under 70 chars, no hashtags, no clickbait lies",
-"hashtags": ["5 relevant hashtags without #"], "unsafe": true/false}}
-Set unsafe true if it contains slurs, sexual content, real violence, doxxing, or the moment needs lots of context."""
+{{"funny": 0-10, "hook": 0-10, "standalone": 0-10,
+"score": 0-100 overall chance this goes viral (70+ only if you would genuinely share it),
+"reason": "one sentence",
+"start": seconds where the short should start (cut dead air before the hook), "end": seconds where it should end (just after the payoff),
+"title": "punchy title under 60 chars that teases the moment without spoiling it, no hashtags, no lies",
+"hashtags": ["5 relevant hashtags without #"],
+"unsafe": true/false}}
+Set unsafe true for slurs, sexual content, real violence, gambling promos, doxxing, or anything that needs lots of context."""
 
 
 GEMINI = "https://generativelanguage.googleapis.com/v1beta"
@@ -58,41 +71,45 @@ def list_models(api_key: str) -> list[str]:
             if "generateContent" in m.get("supportedGenerationMethods", [])]
 
 
-def _generate(api_key: str, model: str, prompt: str) -> requests.Response:
+def _generate(api_key: str, model: str, prompt: str, video: bytes | None = None) -> requests.Response:
+    parts = [{"text": prompt}]
+    if video:
+        parts.insert(0, {"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(video).decode()}})
     return requests.post(
         f"{GEMINI}/models/{model}:generateContent",
         params={"key": api_key},
         json={
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
         },
         timeout=60,
     )
 
 
-def gemini_json(api_key: str, wanted: str, prompt: str) -> str:
+def gemini_json(api_key: str, wanted: str, prompt: str, video: bytes | None = None) -> str:
     """Call Gemini; if the model is gone (404), switch to the newest flash model and retry."""
     model = _resolved_model.get(wanted, wanted)
-    r = _generate(api_key, model, prompt)
+    r = _generate(api_key, model, prompt, video)
     if r.status_code == 404:
         names = [n for n in list_models(api_key) if n.removeprefix("models/") != model]
         alt = pick_flash_model(names)
         print(f"  Gemini model '{model}' unavailable ({r.text[:150]!r}); switching to '{alt}'")
         if alt:
             _resolved_model[wanted] = model = alt
-            r = _generate(api_key, model, prompt)
+            r = _generate(api_key, model, prompt, video)
     for wait in (5, 15):  # Gemini's free tier sometimes returns 503/429 when busy
         if r.status_code not in (429, 500, 503):
             break
         time.sleep(wait)
-        r = _generate(api_key, model, prompt)
+        r = _generate(api_key, model, prompt, video)
     if not r.ok:
         raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
-def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
-    fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key"}
+def ai_judge(clip, transcript: str, api_key: str | None, model: str, video: bytes | None = None) -> dict:
+    fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key",
+                "start": 0.0, "end": None}
     if not api_key:
         return fallback
     prompt = PROMPT.format(
@@ -101,30 +118,44 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
         title=clip.title,
         views=clip.view_count,
         age=clip.age_hours,
+        duration=clip.duration,
         transcript=(transcript or "(no speech)")[:3000],
     )
     try:
-        text = gemini_json(api_key, model, prompt)
-        return parse_judgement(text, clip.title)
+        text = gemini_json(api_key, model, prompt, video)
+        return parse_judgement(text, clip.title, clip.duration)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")
         return fallback
 
 
-def parse_judgement(text: str, default_title: str) -> dict:
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_judgement(text: str, default_title: str, duration: float | None = None) -> dict:
     m = re.search(r"\{.*\}", text, re.S)
     data = json.loads(m.group(0) if m else text)
-    score = data.get("score")
+    score = _num(data.get("score"))
+    start, end = _num(data.get("start")) or 0.0, _num(data.get("end"))
+    # Only trust a trim that keeps a sensible length; otherwise use the whole clip.
+    if end is None or end - start < 6 or start < 0 or (duration and end > duration + 1):
+        start, end = 0.0, None
     return {
-        "score": float(score) if isinstance(score, (int, float)) else None,
+        "score": score,
         "title": (data.get("title") or default_title).strip()[:90],
         "hashtags": [h.lstrip("#").replace(" ", "") for h in data.get("hashtags", []) if h][:8],
         "unsafe": bool(data.get("unsafe", False)),
         "reason": data.get("reason", ""),
+        "start": max(0.0, start - 0.3) if start else 0.0,
+        "end": end + 0.5 if end else None,
     }
 
 
 def final_score(heuristic: float, ai_score: float | None) -> float:
     if ai_score is None:
         return heuristic
-    return round(0.4 * heuristic + 0.6 * ai_score, 1)
+    return round(0.25 * heuristic + 0.75 * ai_score, 1)

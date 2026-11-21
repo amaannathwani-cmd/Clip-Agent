@@ -2,8 +2,10 @@
 import subprocess
 from pathlib import Path
 
+from .layout import Layout, plan, video_filter
+
 W, H = 1080, 1920
-CAPTION_Y = 1390  # captions sit under the video
+CAPTION_Y = 1390  # default caption height (blur layout)
 HIGHLIGHT = "&H0000E5FF&"  # yellow (ASS colours are BGR)
 
 
@@ -30,7 +32,7 @@ def chunk_words(words, max_words: int = 3, max_gap: float = 0.6):
     return chunks
 
 
-def build_ass(words, credit: str | None = None, duration: float = 60.0) -> str:
+def build_ass(words, credit: str | None = None, duration: float = 60.0, caption_y: int = CAPTION_Y) -> str:
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -59,31 +61,34 @@ def build_ass(words, credit: str | None = None, duration: float = 60.0) -> str:
                 t = _esc(cw.text.upper())
                 parts.append(f"{{\\c{HIGHLIGHT}\\fscx110\\fscy110}}{t}{{\\r}}" if j == i else t)
             lines.append(
-                f"Dialogue: 1,{_ts(start)},{_ts(end)},Cap,,0,0,0,,{{\\pos({W // 2},{CAPTION_Y})}}" + " ".join(parts)
+                f"Dialogue: 1,{_ts(start)},{_ts(end)},Cap,,0,0,0,,{{\\pos({W // 2},{caption_y})}}" + " ".join(parts)
             )
     return "\n".join(lines) + "\n"
 
 
-FILTER = (
-    "[0:v]split=2[a][b];"
-    f"[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=25:3,eq=brightness=-0.12[bg];"
-    # crop the centre of the frame to 4:3 so the action is bigger, then fit to full width
-    f"[b]crop='min(iw,ih*4/3)':ih,scale={W}:-2[fg];"
-    "[bg][fg]overlay=(W-w)/2:(H-h)/2-160,ass=subs.ass[v]"
-)
+def shift_words(words, start: float, end: float):
+    """Keep words inside [start, end) and make their times relative to start."""
+    from .media import Word
+    return [Word(w.start - start, min(w.end, end) - start, w.text) for w in words if w.start >= start and w.start < end]
 
 
-def render(src: Path, words, out: Path, credit: str | None, max_seconds: float = 60.0) -> Path:
+def render(src: Path, words, out: Path, credit: str | None, max_seconds: float = 60.0,
+           start: float = 0.0, end: float | None = None, layout: Layout | None = None) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     workdir = src.parent
-    (workdir / "subs.ass").write_text(build_ass(words, credit, max_seconds), encoding="utf-8")
+    end = min(end if end is not None else start + max_seconds, start + max_seconds)
+    length = end - start
+    layout = layout or plan(src)
+    print(f"  layout: {layout.kind}")
+    (workdir / "subs.ass").write_text(
+        build_ass(shift_words(words, start, end), credit, length, layout.caption_y), encoding="utf-8")
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(src.resolve()),
-        "-filter_complex", FILTER,
+        "-ss", f"{start:.2f}", "-i", str(src.resolve()),
+        "-filter_complex", video_filter(layout),
         "-map", "[v]", "-map", "0:a?",
         "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-        "-t", str(max_seconds),
+        "-t", f"{length:.2f}",
         "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
         "-movflags", "+faststart",

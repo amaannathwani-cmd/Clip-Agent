@@ -56,3 +56,26 @@ def transcribe(path: Path, model_name: str = "small") -> list[Word]:
             if text:
                 words.append(Word(float(w.start), float(w.end), text))
     return words
+
+
+def proxy_bytes(path: Path, max_bytes: int = 14 * 1024 * 1024) -> bytes | None:
+    """A small 360p copy for the AI to watch (inline uploads must stay under ~20MB)."""
+    out = path.with_name("proxy.mp4")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-vf", "scale=-2:360,fps=15",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "32", "-c:a", "aac", "-b:a", "64k", "-ac", "1",
+         str(out)],
+        check=True,
+    )
+    data = out.read_bytes()
+    return data if len(data) <= max_bytes else None
+
+
+def timed_transcript(words: list[Word]) -> str:
+    """Transcript with a [seconds] marker every few words so the AI can pick start/end points."""
+    parts = []
+    for i, w in enumerate(words):
+        if i % 6 == 0:
+            parts.append(f"[{w.start:.1f}]")
+        parts.append(w.text)
+    return " ".join(parts)

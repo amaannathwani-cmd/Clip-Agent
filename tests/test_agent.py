@@ -35,7 +35,7 @@ def test_heuristic_prefers_fast_clips():
 def test_parse_judgement_and_blend():
     j = parse_judgement('```json\n{"score": 80, "title": "He did WHAT", "hashtags": ["#gaming", "funny clip"], "unsafe": false}\n```', "x")
     assert j["score"] == 80 and j["hashtags"] == ["gaming", "funnyclip"]
-    assert final_score(50, 80) == 68.0
+    assert final_score(50, 80) == 72.5
     assert final_score(50, None) == 50
 
 
@@ -65,3 +65,55 @@ def test_pick_flash_model_prefers_newest_stable():
     assert pick_flash_model(names) == "gemini-3.0-flash"
     assert pick_flash_model(["models/gemini-4-flash-preview"]) == "gemini-4-flash-preview"
     assert pick_flash_model(["models/gemini-3.0-pro"]) is None
+
+
+def test_parse_judgement_trim_rules():
+    j = parse_judgement('{"score": 75, "start": 4.0, "end": 19.0}', "x", 30)
+    assert j["start"] == 3.7 and j["end"] == 19.5
+    j = parse_judgement('{"score": 75, "start": 4.0, "end": 6.0}', "x", 30)   # too short -> whole clip
+    assert j["start"] == 0.0 and j["end"] is None
+    j = parse_judgement('{"score": 75, "start": 0, "end": 99}', "x", 30)     # past the end -> whole clip
+    assert j["end"] is None
+
+
+def test_shift_words_and_timed_transcript():
+    from clip_agent.editor import shift_words
+    from clip_agent.media import timed_transcript
+    shifted = shift_words(WORDS, 0.5, 2.0)
+    assert [w.text for w in shifted] == ["way", "he"] and shifted[0].start == 0.0
+    assert timed_transcript(WORDS).startswith("[0.2] no way")
+
+
+def test_choose_layout():
+    from clip_agent.layout import choose_layout
+    # small steady face bottom-left -> facecam split
+    cam = [(120, 760, 90, 90)] * 10
+    lay = choose_layout(1920, 1080, cam)
+    assert lay.kind == "split"
+    c = lay.cam
+    assert c.x <= 120 and c.x + c.w >= 210 and c.y + c.h <= 1080 and c.x >= 0
+    # big face -> follow-cam crop
+    lay = choose_layout(1920, 1080, [(800, 300, 320, 320)] * 10)
+    assert lay.kind == "face" and lay.crop.w == 606 and 600 < lay.crop.x + lay.crop.w / 2 < 1320
+    # no / jumpy faces -> blur
+    assert choose_layout(1920, 1080, []).kind == "blur"
+    jumpy = [(100 + i * 170, 100 + (i % 3) * 300, 80, 80) for i in range(10)]
+    assert choose_layout(1920, 1080, jumpy).kind == "blur"
+
+
+import pytest
+
+
+@pytest.mark.parametrize("faces", [[(120, 760, 90, 90)] * 10, [(800, 300, 320, 320)] * 10, []])
+def test_render_each_layout(tmp_path, faces):
+    from clip_agent.layout import choose_layout
+    src = tmp_path / "source.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30",
+                    "-f", "lavfi", "-i", "sine=frequency=440", "-t", "6", "-shortest", str(src)], check=True)
+    out = render(src, WORDS, tmp_path / "out.mp4", "twitch.tv/x", 60, start=1.0, end=4.0,
+                 layout=choose_layout(1920, 1080, faces))
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height:format=duration",
+                            "-of", "default=nw=1", str(out)], capture_output=True, text=True).stdout
+    assert "width=1080" in probe and "height=1920" in probe
+    dur = float([l for l in probe.splitlines() if l.startswith("duration=")][0].split("=")[1])
+    assert 2.8 < dur < 3.3

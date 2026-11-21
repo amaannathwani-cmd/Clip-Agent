@@ -12,7 +12,7 @@ from pathlib import Path
 from . import state as st
 from .config import ROOT, env, load_config
 from .editor import render
-from .media import download, transcribe
+from .media import download, proxy_bytes, timed_transcript, transcribe
 from .scorer import ai_judge, final_score, heuristic_score
 from .twitch import Clip, Twitch, find_candidates
 
@@ -42,10 +42,17 @@ def process(clip: Clip, cfg: dict, gemini_key: str | None) -> dict | None:
     print(f"- {clip.broadcaster_login}: '{clip.title}' ({clip.view_count} views, heuristic {clip.heuristic})")
     src = download(clip.url, WORK / clip.id, "source")
     words = transcribe(src, vcfg.get("whisper_model", "small"))
-    transcript = " ".join(w.text for w in words)
-    judged = ai_judge(clip, transcript, gemini_key, cfg.get("ai", {}).get("gemini_model", "gemini-2.5-flash"))
+    video = None
+    if gemini_key and cfg.get("ai", {}).get("watch_video", True):
+        try:
+            video = proxy_bytes(src)
+        except Exception as e:
+            print(f"  could not make AI preview: {e}")
+    judged = ai_judge(clip, timed_transcript(words), gemini_key,
+                      cfg.get("ai", {}).get("gemini_model", "gemini-2.5-flash"), video)
     score = final_score(clip.heuristic, judged["score"])
-    print(f"  AI {judged['score']} -> final {score}; unsafe={judged['unsafe']}; {judged.get('reason', '')}")
+    trim = f"{judged['start']:.1f}-{judged['end']:.1f}s" if judged.get("end") else "full"
+    print(f"  AI {judged['score']} -> final {score}; trim {trim}; unsafe={judged['unsafe']}; {judged.get('reason', '')}")
     return {"clip": clip, "src": src, "words": words, "judged": judged, "score": score}
 
 
@@ -68,8 +75,18 @@ def run(dry_run: bool = False, clip_url: str | None = None) -> None:
         candidates.sort(key=lambda c: c.heuristic, reverse=True)
         print(f"Found {len(candidates)} new candidate clips")
 
+    # Spread the AI's attention across streamers instead of judging five clips of the same person.
+    per_streamer: dict[str, int] = {}
+    shortlist = []
+    for c in candidates:
+        if per_streamer.get(c.broadcaster_login, 0) < sel.get("max_per_streamer", 2):
+            per_streamer[c.broadcaster_login] = per_streamer.get(c.broadcaster_login, 0) + 1
+            shortlist.append(c)
+        if len(shortlist) >= sel.get("judge_top", 8):
+            break
+
     judged = []
-    for clip in candidates[: sel.get("judge_top", 4)]:
+    for clip in shortlist:
         try:
             r = process(clip, cfg, gemini_key)
             if r and not r["judged"]["unsafe"]:
@@ -87,7 +104,8 @@ def run(dry_run: bool = False, clip_url: str | None = None) -> None:
         clip = r["clip"]
         credit = f"twitch.tv/{clip.broadcaster_login}" if cfg.get("video", {}).get("show_credit", True) else None
         out = render(r["src"], r["words"], OUT / f"{clip.id}.mp4", credit,
-                     min(clip.duration or 60, cfg.get("twitch", {}).get("max_seconds", 60)))
+                     min(clip.duration or 60, cfg.get("twitch", {}).get("max_seconds", 60)),
+                     start=r["judged"].get("start") or 0.0, end=r["judged"].get("end"))
         title, desc, tags = describe(clip, r["judged"])
         print(f"Rendered {out.name}: {title}")
         if dry_run:
