@@ -1,4 +1,5 @@
 """Score clips: a fast heuristic on view velocity, then an AI judge on the transcript."""
+import base64
 import json
 import math
 import re
@@ -16,20 +17,32 @@ def heuristic_score(clip) -> float:
     return round(100 * (0.6 * v + 0.4 * rel) * length, 1)
 
 
-PROMPT = """You pick Twitch clips to repost as YouTube Shorts / TikToks.
-Judge whether this clip would go viral with people who have never heard of the streamer
-(funny, shocking, skillful, rage, wholesome, a clear moment within the first 3 seconds).
+PROMPT = """You run a viral clips channel that reposts Twitch moments as YouTube Shorts and TikToks.
+You are shown the clip itself (video + audio) plus its transcript. Be a harsh judge: most clips are boring.
+
+What goes viral with strangers who have never heard of the streamer:
+- genuinely funny moments: big reactions, fails, awkward silences, unexpected one-liners, chat or friends roasting them
+- shock / jump scares / rage / "no way" skill moments
+- a clear payoff that lands within ~20 seconds, and a hook in the first 2 seconds
+What does NOT: giveaways, sub alerts, talking about plans, inside jokes, long setups, menus/loading screens,
+clips that are cut off before the payoff, anything that needs context.
 
 Streamer: {streamer}
 Game/category: {game}
 Original clip title: {title}
 Views: {views} in {age:.1f} hours
-Transcript: {transcript}
+Clip length: {duration:.0f}s
+Transcript (with seconds): {transcript}
 
 Reply with JSON only:
-{{"score": 0-100, "reason": "short", "title": "catchy short title under 70 chars, no hashtags, no clickbait lies",
-"hashtags": ["5 relevant hashtags without #"], "unsafe": true/false}}
-Set unsafe true if it contains slurs, sexual content, real violence, doxxing, or the moment needs lots of context."""
+{{"funny": 0-10, "hook": 0-10, "standalone": 0-10,
+"score": 0-100 overall chance this goes viral (70+ only if you would genuinely share it),
+"reason": "one sentence",
+"start": seconds where the short should start (cut dead air before the hook), "end": seconds where it should end (just after the payoff),
+"title": "punchy title under 60 chars that teases the moment without spoiling it, no hashtags, no lies",
+"hashtags": ["5 relevant hashtags without #"],
+"unsafe": true/false}}
+Set unsafe true for slurs, sexual content, real violence, gambling promos, doxxing, or anything that needs lots of context."""
 
 
 GEMINI = "https://generativelanguage.googleapis.com/v1beta"
@@ -58,41 +71,88 @@ def list_models(api_key: str) -> list[str]:
             if "generateContent" in m.get("supportedGenerationMethods", [])]
 
 
-def _generate(api_key: str, model: str, prompt: str) -> requests.Response:
+def _generate(api_key: str, model: str, prompt: str, video: bytes | None = None) -> requests.Response:
+    parts = [{"text": prompt}]
+    if video:
+        parts.insert(0, {"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(video).decode()}})
     return requests.post(
         f"{GEMINI}/models/{model}:generateContent",
         params={"key": api_key},
         json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4},
+            "contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.4,
+                                 **({"mediaResolution": "MEDIA_RESOLUTION_LOW"} if video else {})},
         },
-        timeout=60,
+        timeout=180 if video else 60,
     )
 
 
-def gemini_json(api_key: str, wanted: str, prompt: str) -> str:
-    """Call Gemini; if the model is gone (404), switch to the newest flash model and retry."""
-    model = _resolved_model.get(wanted, wanted)
-    r = _generate(api_key, model, prompt)
-    if r.status_code == 404:
-        names = [n for n in list_models(api_key) if n.removeprefix("models/") != model]
-        alt = pick_flash_model(names)
-        print(f"  Gemini model '{model}' unavailable ({r.text[:150]!r}); switching to '{alt}'")
-        if alt:
-            _resolved_model[wanted] = model = alt
-            r = _generate(api_key, model, prompt)
-    for wait in (5, 15):  # Gemini's free tier sometimes returns 503/429 when busy
-        if r.status_code not in (429, 500, 503):
+def rank_flash_models(names: list[str]) -> list[str]:
+    """All usable flash models, best first: newest stable, then previews, then the cheaper 'lite' ones."""
+    skip = ("image", "tts", "audio", "live", "embedding", "thinking", "exp")
+    good = [n.removeprefix("models/") for n in names if "flash" in n and not any(k in n for k in skip)]
+
+    def key(n: str):
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("lite" in n, "preview" in n, -(float(m.group(1)) if m else 0.0), len(n))
+
+    return sorted(dict.fromkeys(good), key=key)
+
+
+def _err(r: requests.Response) -> str:
+    try:
+        return f"{r.status_code} {r.json()['error'].get('message', '')[:160]}"
+    except Exception:
+        return f"{r.status_code} {r.text[:160]}"
+
+
+_model_list: list[str] | None = None
+
+
+def gemini_json(api_key: str, wanted: str, prompt: str, video: bytes | None = None) -> str:
+    """Call Gemini. If a model is retired, rate-limited or overloaded, fall through to the next flash model."""
+    global _model_list
+    first = _resolved_model.get(wanted, wanted)
+    tried, last = [], "no model available"
+    order = [first]
+    while order:
+        model = order.pop(0)
+        if video and tried:
+            time.sleep(2)
+        if model in tried:
+            continue
+        tried.append(model)
+        r = None
+        for attempt in range(2):
+            try:
+                r = _generate(api_key, model, prompt, video)
+            except requests.RequestException as e:
+                last = f"{model}: {type(e).__name__}"
+                break
+            if r.ok:
+                if model != first:
+                    print(f"  using Gemini model '{model}'")
+                _resolved_model[wanted] = model
+                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            last = f"{model}: {_err(r)}"
+            if r.status_code in (500, 503) and attempt == 0:
+                time.sleep(5)
+                continue
             break
-        time.sleep(wait)
-        r = _generate(api_key, model, prompt)
-    if not r.ok:
-        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        if r is not None and not r.ok and r.status_code not in (404, 429, 500, 503):
+            break  # a real error (bad key, bad request): switching models won't help
+        if _model_list is None:
+            try:
+                _model_list = rank_flash_models(list_models(api_key))
+            except Exception:
+                _model_list = []
+        order = [m for m in _model_list if m not in tried] if len(tried) < 4 else []
+    raise RuntimeError(f"Gemini failed ({last})")
 
 
-def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
-    fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key"}
+def ai_judge(clip, transcript: str, api_key: str | None, model: str, video: bytes | None = None) -> dict:
+    fallback = {"score": None, "title": clip.title, "hashtags": [], "unsafe": False, "reason": "no AI key",
+                "start": 0.0, "end": None}
     if not api_key:
         return fallback
     prompt = PROMPT.format(
@@ -101,30 +161,53 @@ def ai_judge(clip, transcript: str, api_key: str | None, model: str) -> dict:
         title=clip.title,
         views=clip.view_count,
         age=clip.age_hours,
+        duration=clip.duration,
         transcript=(transcript or "(no speech)")[:3000],
     )
     try:
-        text = gemini_json(api_key, model, prompt)
-        return parse_judgement(text, clip.title)
+        try:
+            text = gemini_json(api_key, model, prompt, video)
+        except Exception as e:
+            if not video:
+                raise
+            print(f"  AI couldn't watch the video ({str(e)[:120]}); judging from the transcript only")
+            text = gemini_json(api_key, model, prompt, None)
+        try:
+            return parse_judgement(text, clip.title, clip.duration)
+        except ValueError:  # malformed JSON: ask once more
+            return parse_judgement(gemini_json(api_key, model, prompt, video), clip.title, clip.duration)
     except Exception as e:  # never let the AI step kill the run
         print(f"  AI judge failed: {e}")
         return fallback
 
 
-def parse_judgement(text: str, default_title: str) -> dict:
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_judgement(text: str, default_title: str, duration: float | None = None) -> dict:
     m = re.search(r"\{.*\}", text, re.S)
     data = json.loads(m.group(0) if m else text)
-    score = data.get("score")
+    score = _num(data.get("score"))
+    start, end = _num(data.get("start")) or 0.0, _num(data.get("end"))
+    # Only trust a trim that keeps a sensible length; otherwise use the whole clip.
+    if end is None or end - start < 6 or start < 0 or (duration and end > duration + 1):
+        start, end = 0.0, None
     return {
-        "score": float(score) if isinstance(score, (int, float)) else None,
+        "score": score,
         "title": (data.get("title") or default_title).strip()[:90],
         "hashtags": [h.lstrip("#").replace(" ", "") for h in data.get("hashtags", []) if h][:8],
         "unsafe": bool(data.get("unsafe", False)),
         "reason": data.get("reason", ""),
+        "start": max(0.0, start - 0.3) if start else 0.0,
+        "end": end + 0.5 if end else None,
     }
 
 
 def final_score(heuristic: float, ai_score: float | None) -> float:
     if ai_score is None:
         return heuristic
-    return round(0.4 * heuristic + 0.6 * ai_score, 1)
+    return round(0.25 * heuristic + 0.75 * ai_score, 1)
